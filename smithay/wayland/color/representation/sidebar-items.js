@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["get_color_representation"],"mod":["wp_color_representation_manager_v1","wp_color_representation_v1"],"struct":["ColorRepresentation","ColorRepresentationState"],"trait":["ColorRepresentationHandler"]};
