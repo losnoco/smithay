@@ -168,6 +168,22 @@ impl DrmSyncPoint {
         res
     }
 
+    /// Import a DRM sync file into the sync point.
+    ///
+    /// The sync point will signal when the fence contained in the sync file signals,
+    /// without a separate call to [`Self::signal`].
+    pub fn import_sync_file(&self, sync_file: BorrowedFd<'_>) -> io::Result<()> {
+        let ctx = self.timeline.0.dev_ctx.lock().unwrap();
+        let Some(device) = ctx.device.upgrade() else {
+            return Err(io::ErrorKind::InvalidInput.into());
+        };
+
+        let syncobj = device.fd_to_syncobj(sync_file, true)?;
+        let res = device.syncobj_timeline_transfer(syncobj, ctx.syncobj, 0, self.point);
+        let _ = device.destroy_syncobj(syncobj);
+        res
+    }
+
     /// Create an [`calloop::EventSource`] and [`Blocker`] for this sync point.
     ///
     /// This will fail if `drmSyncobjEventfd` isn't supported by the device. See
