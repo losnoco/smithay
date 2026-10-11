@@ -256,16 +256,31 @@ pub struct ColorPipeline {
 }
 
 impl ColorPipeline {
-    /// Whether this pipeline applies to framebuffers of the given format.
+    /// Which of [`ops`](Self::ops) take effect on framebuffers of the given format, or `None`
+    /// if the pipeline doesn't apply to that format at all. Ops without effect are accepted by
+    /// the driver but must be left bypassed (or at the identity).
     ///
-    /// The uAPI has no way to tie pipelines to formats, but nvidia-drm implements the 1D
-    /// curve, 1D LUT and multiplier ops of its "NVIDIA Full" and "NVIDIA Lite" pipelines on
-    /// the plane's input LUT, which the hardware skips for floating-point framebuffers: those
-    /// ops are silently ignored there (e.g. an unapplied multiplier leaves FP16 scRGB content
-    /// unscaled). It advertises "NVIDIA FP Full" and "NVIDIA FP Lite", which leave these ops
-    /// out, for floating-point framebuffers instead.
-    pub fn supports_format(&self, format: Fourcc) -> bool {
-        !(is_float_format(format) && self.name.starts_with("NVIDIA ") && !self.name.contains(" FP "))
+    /// The uAPI has no way to tie pipelines to formats, but nvidia's display engine skips
+    /// parts of the plane pipeline for floating-point framebuffers, silently:
+    ///
+    /// - nvidia-drm implements the 1D curve, 1D LUT and multiplier ops of its "NVIDIA Full"
+    ///   and "NVIDIA Lite" pipelines on the plane's input LUT, which is disabled for FP16
+    ///   surfaces (e.g. an unapplied multiplier leaves FP16 scRGB content unscaled). It
+    ///   advertises "NVIDIA FP Full" and "NVIDIA FP Lite", which leave these ops out, for
+    ///   floating-point framebuffers instead.
+    /// - The leading 3x4 matrix of every NVIDIA pipeline is the FMT matrix, which converts the
+    ///   surface format to the pipe's native FP16; it has no effect on FP16 surfaces.
+    pub fn effective_ops(&self, format: Fourcc) -> Option<Vec<bool>> {
+        let mut effective = vec![true; self.ops.len()];
+        if is_float_format(format) && self.name.starts_with("NVIDIA ") {
+            if !self.name.contains(" FP ") {
+                return None;
+            }
+            if self.ops.first().is_some_and(|op| op.kind == ColorOpKind::Ctm3x4) {
+                effective[0] = false;
+            }
+        }
+        Some(effective)
     }
 }
 
@@ -559,8 +574,13 @@ impl ScanoutColorTransform {
     /// tied to the returned value.
     ///
     /// Returns `None` if the pipeline cannot express the transform.
-    pub fn resolve(&self, device: &DrmDeviceFd, pipeline: &ColorPipeline) -> Option<ResolvedColorPipeline> {
-        let plan = self.plan(pipeline)?;
+    pub fn resolve(
+        &self,
+        device: &DrmDeviceFd,
+        pipeline: &ColorPipeline,
+        format: Fourcc,
+    ) -> Option<ResolvedColorPipeline> {
+        let plan = self.plan_for_format(pipeline, format)?;
 
         let mut resolved = ResolvedColorPipeline {
             pipeline_id: pipeline.id,
@@ -586,7 +606,18 @@ impl ScanoutColorTransform {
 
     /// Finds how to program every op of `pipeline` for this transform, without touching the
     /// device. See [`Self::resolve`].
+    #[cfg(test)]
     fn plan(&self, pipeline: &ColorPipeline) -> Option<Vec<OpPlan>> {
+        self.plan_with(pipeline, &vec![true; pipeline.ops.len()])
+    }
+
+    /// [`Self::plan`] for framebuffers of `format`, see [`ColorPipeline::effective_ops`].
+    fn plan_for_format(&self, pipeline: &ColorPipeline, format: Fourcc) -> Option<Vec<OpPlan>> {
+        self.plan_with(pipeline, &pipeline.effective_ops(format)?)
+    }
+
+    /// Plans with only the `effective` ops taking stages; the others are left inert.
+    fn plan_with(&self, pipeline: &ColorPipeline, effective: &[bool]) -> Option<Vec<OpPlan>> {
         let stages = PendingStages {
             decode: self.decode,
             gain: self.multiplier,
@@ -595,7 +626,7 @@ impl ScanoutColorTransform {
         };
         let mut best = None;
         let mut current = Vec::with_capacity(pipeline.ops.len());
-        plan_ops(&pipeline.ops, stages, 0, &mut current, &mut best);
+        plan_ops(&pipeline.ops, effective, stages, 0, &mut current, &mut best);
         best.map(|(_, plan)| plan)
     }
 }
@@ -618,7 +649,7 @@ enum OpPlan {
 }
 
 /// The stages of a [`ScanoutColorTransform`] that are not placed on an op yet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct PendingStages {
     decode: Option<Curve1DType>,
     /// A gain still to be applied to the (decoded) values; 1.0 once placed. A decode LUT can
@@ -641,6 +672,7 @@ impl PendingStages {
 /// Depth-first search over the ways to program `ops`, keeping the cheapest complete plan.
 fn plan_ops(
     ops: &[ColorOp],
+    effective: &[bool],
     stages: PendingStages,
     cost: u32,
     current: &mut Vec<OpPlan>,
@@ -655,9 +687,14 @@ fn plan_ops(
         }
         return;
     };
+    let (is_effective, rest_effective) = effective.split_first().unwrap_or((&true, &[]));
     for (plan, next, op_cost) in op_options(op, stages) {
+        // An op without effect may only be programmed in ways that place no stage.
+        if !is_effective && next != stages {
+            continue;
+        }
         current.push(plan);
-        plan_ops(rest, next, cost + op_cost, current, best);
+        plan_ops(rest, rest_effective, next, cost + op_cost, current, best);
         current.pop();
     }
 }
@@ -1301,13 +1338,14 @@ mod tests {
         let float = |format| {
             pipelines
                 .iter()
-                .filter(|p| p.supports_format(format))
+                .filter(|p| p.effective_ops(format).is_some())
                 .map(|p| p.name.as_str())
                 .collect::<Vec<_>>()
         };
         assert_eq!(float(Fourcc::Abgr16161616f), ["NVIDIA FP Full", "NVIDIA FP Lite"]);
         assert_eq!(float(Fourcc::Xbgr16161616f), ["NVIDIA FP Full", "NVIDIA FP Lite"]);
         assert_eq!(float(Fourcc::Abgr2101010).len(), 4);
+        assert_eq!(nvidia_lite().effective_ops(Fourcc::Abgr2101010), Some(vec![true; 5]));
 
         let linear_max = 1000. / 80.;
         let scrgb_linear = ScanoutColorTransform {
@@ -1316,19 +1354,19 @@ mod tests {
             ctm: Some(BT709_TO_BT2020),
             encode: None,
         };
-        let chosen = pipelines
+        let (name, plan) = pipelines
             .iter()
-            .filter(|p| p.supports_format(Fourcc::Abgr16161616f))
-            .find_map(|p| Some((p.name.as_str(), scrgb_linear.plan(p)?)))
+            .find_map(|p| Some((p.name.as_str(), scrgb_linear.plan_for_format(p, Fourcc::Xbgr16161616f)?)))
             .unwrap();
-        assert_eq!(chosen.0, "NVIDIA FP Lite");
-        let gain = 1. / linear_max;
-        let scaled = BT709_TO_BT2020.map(|v| v * gain);
-        assert!(chosen.1.iter().any(|op| match op {
-            OpPlan::Ctm(m) => m.iter().zip(&scaled).all(|(a, b)| (a - b).abs() < 1e-9),
-            _ => false,
-        }));
-        assert!(!chosen.1.iter().any(|op| matches!(op, OpPlan::Multiplier(_))));
+        assert_eq!(name, "NVIDIA FP Lite");
+        // The FMT matrix has no effect on FP16 surfaces, so the gain and gamut conversion land
+        // on the blend matrix.
+        let scaled = BT709_TO_BT2020.map(|v| v * (1. / linear_max));
+        assert_eq!(plan[0], OpPlan::Bypass);
+        let OpPlan::Ctm(m) = plan[1] else {
+            panic!("expected a matrix, got {:?}", plan[1]);
+        };
+        assert!(m.iter().zip(&scaled).all(|(a, b)| (a - b).abs() < 1e-9));
     }
 
     #[test]

@@ -3401,8 +3401,8 @@ where
             .ok_or(())
     }
 
-    /// Resolves a non-identity transform against the pipelines of `plane` that apply to
-    /// framebuffers of `format`, caching the result.
+    /// Resolves a non-identity transform against the pipelines of `plane` for framebuffers of
+    /// `format`, caching the result.
     fn resolve_color_transform(
         &self,
         plane: plane::Handle,
@@ -3421,8 +3421,7 @@ where
             .get(&plane)
             .into_iter()
             .flatten()
-            .filter(|pipeline| pipeline.supports_format(format))
-            .find_map(|pipeline| transform.resolve(self.surface.device_fd(), pipeline))
+            .find_map(|pipeline| transform.resolve(self.surface.device_fd(), pipeline, format))
             .map(Arc::new);
         if resolved.is_none() {
             let pipelines = self.plane_color_pipelines.get(&plane).map_or(0, Vec::len);
