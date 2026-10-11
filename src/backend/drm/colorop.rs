@@ -27,6 +27,7 @@ use std::sync::Arc;
 use drm::control::{Device as ControlDevice, RawResourceHandle, from_u32, plane, property};
 
 use super::DrmDeviceFd;
+use crate::backend::allocator::Fourcc;
 use super::error::{AccessError, Error};
 use crate::utils::DevPath;
 
@@ -248,8 +249,31 @@ pub struct ColorPipeline {
     /// The value to set the plane's `COLOR_PIPELINE` property to in order to select this
     /// pipeline (the object id of the first colorop).
     pub id: u64,
+    /// The pipeline's name, i.e. the name of its `COLOR_PIPELINE` enum entry.
+    pub name: String,
     /// The color operations of this pipeline, in processing order.
     pub ops: Vec<ColorOp>,
+}
+
+impl ColorPipeline {
+    /// Whether this pipeline applies to framebuffers of the given format.
+    ///
+    /// The uAPI has no way to tie pipelines to formats, but nvidia-drm implements the 1D
+    /// curve, 1D LUT and multiplier ops of its "NVIDIA Full" and "NVIDIA Lite" pipelines on
+    /// the plane's input LUT, which the hardware skips for floating-point framebuffers: those
+    /// ops are silently ignored there (e.g. an unapplied multiplier leaves FP16 scRGB content
+    /// unscaled). It advertises "NVIDIA FP Full" and "NVIDIA FP Lite", which leave these ops
+    /// out, for floating-point framebuffers instead.
+    pub fn supports_format(&self, format: Fourcc) -> bool {
+        !(is_float_format(format) && self.name.starts_with("NVIDIA ") && !self.name.contains(" FP "))
+    }
+}
+
+fn is_float_format(format: Fourcc) -> bool {
+    matches!(
+        format,
+        Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f | Fourcc::Argb16161616f | Fourcc::Xrgb16161616f
+    )
 }
 
 /// Queries the color pipelines advertised on a plane.
@@ -283,15 +307,19 @@ where
             return Ok(Vec::new());
         };
 
-        let (values, _) = enum_values.values();
+        let (_, entries) = enum_values.values();
         let mut pipelines = Vec::new();
-        for &value in values {
+        for entry in entries {
+            let value = entry.value();
             // 0 is the always-present "Bypass" entry, not a pipeline.
             if value == 0 {
                 continue;
             }
             match walk_pipeline(dev, value) {
-                Ok(pipeline) => pipelines.push(pipeline),
+                Ok(mut pipeline) => {
+                    pipeline.name = entry.name().to_string_lossy().into_owned();
+                    pipelines.push(pipeline);
+                }
                 Err(err) => {
                     trace!(?plane, value, "skipping unusable color pipeline: {err:?}");
                 }
@@ -324,7 +352,11 @@ where
         ops.push(op.op);
     }
 
-    Ok(ColorPipeline { id: first, ops })
+    Ok(ColorPipeline {
+        id: first,
+        name: String::new(),
+        ops,
+    })
 }
 
 struct ReadColorOp {
@@ -1018,6 +1050,7 @@ mod tests {
     fn nvidia_full() -> ColorPipeline {
         ColorPipeline {
             id: 58,
+            name: "NVIDIA Full".into(),
             ops: vec![
                 op(58, ColorOpKind::Ctm3x4, true),
                 curve(63, &[Curve1DType::Pq125Eotf], true),
@@ -1052,6 +1085,7 @@ mod tests {
     fn nvidia_lite() -> ColorPipeline {
         ColorPipeline {
             id: 115,
+            name: "NVIDIA Lite".into(),
             ops: vec![
                 op(115, ColorOpKind::Ctm3x4, true),
                 curve(120, &[Curve1DType::Pq125Eotf], true),
@@ -1075,6 +1109,7 @@ mod tests {
     fn nvidia_fp_full() -> ColorPipeline {
         ColorPipeline {
             id: 142,
+            name: "NVIDIA FP Full".into(),
             ops: vec![
                 op(142, ColorOpKind::Ctm3x4, true),
                 op(147, ColorOpKind::Ctm3x4, true),
@@ -1099,6 +1134,7 @@ mod tests {
     fn nvidia_fp_lite() -> ColorPipeline {
         ColorPipeline {
             id: 182,
+            name: "NVIDIA FP Lite".into(),
             ops: vec![
                 op(182, ColorOpKind::Ctm3x4, true),
                 op(187, ColorOpKind::Ctm3x4, true),
@@ -1255,6 +1291,46 @@ mod tests {
         assert!(sdr_linear.plan(&nvidia_fp_lite()).is_none());
     }
 
+    /// FP16 scRGB content retargeted at a normalized linear intermediate must not resolve on
+    /// "NVIDIA Lite": its multiplier lives in the input LUT, which the hardware skips for
+    /// floating-point framebuffers, leaving the content unscaled. The FP pipelines take it
+    /// instead, with the gain folded into a matrix.
+    #[test]
+    fn nvidia_float_framebuffers_use_fp_pipelines() {
+        let pipelines = nvidia_pipelines();
+        let float = |format| {
+            pipelines
+                .iter()
+                .filter(|p| p.supports_format(format))
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(float(Fourcc::Abgr16161616f), ["NVIDIA FP Full", "NVIDIA FP Lite"]);
+        assert_eq!(float(Fourcc::Xbgr16161616f), ["NVIDIA FP Full", "NVIDIA FP Lite"]);
+        assert_eq!(float(Fourcc::Abgr2101010).len(), 4);
+
+        let linear_max = 1000. / 80.;
+        let scrgb_linear = ScanoutColorTransform {
+            decode: None,
+            multiplier: 1. / linear_max,
+            ctm: Some(BT709_TO_BT2020),
+            encode: None,
+        };
+        let chosen = pipelines
+            .iter()
+            .filter(|p| p.supports_format(Fourcc::Abgr16161616f))
+            .find_map(|p| Some((p.name.as_str(), scrgb_linear.plan(p)?)))
+            .unwrap();
+        assert_eq!(chosen.0, "NVIDIA FP Lite");
+        let gain = 1. / linear_max;
+        let scaled = BT709_TO_BT2020.map(|v| v * gain);
+        assert!(chosen.1.iter().any(|op| match op {
+            OpPlan::Ctm(m) => m.iter().zip(&scaled).all(|(a, b)| (a - b).abs() < 1e-9),
+            _ => false,
+        }));
+        assert!(!chosen.1.iter().any(|op| matches!(op, OpPlan::Multiplier(_))));
+    }
+
     #[test]
     fn curves_round_trip() {
         let pairs = [
@@ -1290,6 +1366,7 @@ mod tests {
         ];
         let pipeline = ColorPipeline {
             id: 300,
+            name: "test".into(),
             ops: vec![
                 curve(300, &all_curves, true),
                 op(310, ColorOpKind::Multiplier, true),

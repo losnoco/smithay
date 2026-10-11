@@ -175,7 +175,7 @@ use crate::{
     },
     output::OutputModeSource,
     utils::{Buffer as BufferCoords, DevPath, Physical, Point, Rectangle, Scale, Size, Transform},
-    wayland::{shm, single_pixel_buffer},
+    wayland::{dmabuf::get_dmabuf, shm, single_pixel_buffer},
 };
 
 use super::{
@@ -1312,6 +1312,7 @@ where
     resolved_color_pipelines: RefCell<
         Vec<(
             plane::Handle,
+            DrmFourcc,
             ScanoutColorTransform,
             Option<Arc<ResolvedColorPipeline>>,
         )>,
@@ -2264,9 +2265,18 @@ where
                             .post_blend
                             .as_ref()
                             .is_some_and(|state| state.transforms.contains_key(bottom.id()))
-                        && self
-                            .scanout_color_pipeline(bottom.id(), self.surface.plane())
-                            .is_err()
+                        && bottom
+                            .underlying_storage(renderer)
+                            .and_then(|storage| match storage {
+                                UnderlyingStorage::Wayland(buffer) => {
+                                    get_dmabuf(buffer).ok().map(|dmabuf| dmabuf.format().code)
+                                }
+                                UnderlyingStorage::Memory(_) => None,
+                            })
+                            .is_some_and(|format| {
+                                self.scanout_color_pipeline(bottom.id(), self.surface.plane(), format)
+                                    .is_err()
+                            })
                 }
                 _ => false,
             };
@@ -3374,6 +3384,7 @@ where
         &self,
         element_id: &Id,
         plane: plane::Handle,
+        format: DrmFourcc,
     ) -> Result<Option<Arc<ResolvedColorPipeline>>, ()> {
         let transform = match self.element_color_transforms.get(element_id) {
             // Listed with no expressible transform: the element must always be composited.
@@ -3385,20 +3396,23 @@ where
         if transform.is_identity() {
             return Ok(None);
         }
-        self.resolve_color_transform(plane, transform).map(Some).ok_or(())
+        self.resolve_color_transform(plane, format, transform)
+            .map(Some)
+            .ok_or(())
     }
 
-    /// Resolves a non-identity transform against the pipelines of `plane`, caching the result.
+    /// Resolves a non-identity transform against the pipelines of `plane` that apply to
+    /// framebuffers of `format`, caching the result.
     fn resolve_color_transform(
         &self,
         plane: plane::Handle,
+        format: DrmFourcc,
         transform: ScanoutColorTransform,
     ) -> Option<Arc<ResolvedColorPipeline>> {
         let mut cache = self.resolved_color_pipelines.borrow_mut();
-        if let Some((_, _, resolved)) = cache
-            .iter()
-            .find(|(handle, cached, _)| *handle == plane && *cached == transform)
-        {
+        if let Some((_, _, _, resolved)) = cache.iter().find(|(handle, cached_format, cached, _)| {
+            *handle == plane && *cached_format == format && *cached == transform
+        }) {
             return resolved.clone();
         }
 
@@ -3407,6 +3421,7 @@ where
             .get(&plane)
             .into_iter()
             .flatten()
+            .filter(|pipeline| pipeline.supports_format(format))
             .find_map(|pipeline| transform.resolve(self.surface.device_fd(), pipeline))
             .map(Arc::new);
         if resolved.is_none() {
@@ -3414,6 +3429,7 @@ where
             debug!(
                 ?plane,
                 pipelines,
+                ?format,
                 ?transform,
                 "no color pipeline can express the scanout transform, denying scan-out"
             );
@@ -3421,7 +3437,7 @@ where
         if cache.len() >= RESOLVED_COLOR_PIPELINE_CACHE_SIZE {
             cache.remove(0);
         }
-        cache.push((plane, transform, resolved.clone()));
+        cache.push((plane, format, transform, resolved.clone()));
         resolved
     }
 
@@ -3566,6 +3582,7 @@ where
     fn post_blend_offload_pipeline(
         &self,
         element_id: &Id,
+        format: DrmFourcc,
         frame_state: &CompositorFrameState<A, F>,
     ) -> Option<Arc<ResolvedColorPipeline>> {
         let state = self.post_blend.as_ref()?;
@@ -3587,7 +3604,7 @@ where
         let base = if transform.is_identity() {
             None
         } else {
-            Some(self.resolve_color_transform(primary, transform)?)
+            Some(self.resolve_color_transform(primary, format, transform)?)
         };
         Some(Arc::new(ResolvedColorPipeline::with_gamma_lut(
             base.as_deref(),
@@ -4945,11 +4962,12 @@ where
         // it; without color transform state, elements the current policy denies must be
         // rendered instead.
         let is_primary = plane.handle == self.surface.plane();
-        let color_pipeline = match self.scanout_color_pipeline(element_id, plane.handle) {
+        let format = element_config.properties.format.code;
+        let color_pipeline = match self.scanout_color_pipeline(element_id, plane.handle, format) {
             Ok(pipeline) if is_primary => self.with_post_blend_reset(pipeline),
             Ok(pipeline) => pipeline,
             Err(()) => match is_primary
-                .then(|| self.post_blend_offload_pipeline(element_id, frame_state))
+                .then(|| self.post_blend_offload_pipeline(element_id, format, frame_state))
                 .flatten()
             {
                 Some(pipeline) => {
